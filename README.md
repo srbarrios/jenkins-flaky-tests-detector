@@ -102,9 +102,9 @@ python3 src/flaky_detector.py --config config.yaml
 python3 src/serve_results.py --dir ./data
 ```
 
-## Deployment (SaltStack)
+## Deployment (Salt states)
 
-This service is deployed via SaltStack to the monitoring infrastructure.
+This service is deployed via Salt to the monitoring infrastructure.
 
   * **Registry:** `registry.mgr.suse.de/flaky-detector`
   * **Salt State:** `monitoring.flaky_detection`
