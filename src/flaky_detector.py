@@ -84,54 +84,80 @@ def _count_transitions(lst):
 
 
 def _check_rules(history):
-    current_status = history[-1]
-    max_streak = max(history)
+    # --- METRICS CALCULATION ---
+    current_status = history[-1]      # 0 = Pass, >0 = Fail
+    max_streak = max(history)         # Longest failure block
     transitions = _count_transitions(history)
 
-    total = len(history)
-    fails = len([x for x in history if x > 0])
-    failure_rate = fails / total if total > 0 else 0
+    total_points = len(history)
+    failure_points = len([x for x in history if x > 0])
+    failure_rate = failure_points / total_points if total_points > 0 else 0
+
+    # Calculate Recency (How many steps since last failure)
+    # Iterate backwards to find the first non-zero
+    steps_since_fail = 0
+    if current_status == 0 and failure_rate > 0:
+        for i, val in enumerate(reversed(history)):
+            if val > 0:
+                steps_since_fail = i
+                break
+
+    # Thresholds
+    FIXED_THRESHOLD = 48 # If it hasn't failed in 48 steps (hours), consider it Fixed
 
     # --- RULE 1: ENVIRONMENTAL / DEAD ---
-    # If it passed 0% of the time, it's not flaky, it's broken infrastructure.
     if failure_rate == 1.0:
-        return {"pattern": "ENVIRONMENTAL", "score": 0.0, "reason": "Test has 100% failure rate."}
+        return {"pattern": "ENVIRONMENTAL", "score": 0.0, "reason": "INFRA: Test has 100% failure rate."}
 
     # --- RULE 2: FLAKY PATTERNS ---
 
     # 2a. HIGH OSCILLATION (The "Yo-Yo" Effect)
-    # It flips between pass/fail frequently (>= 3 times).
     if transitions >= 3:
         return {"pattern": "FLAKY", "score": 1.0, "reason": f"OSCILLATION: Flipped state {transitions} times."}
 
     # 2b. SPORADIC / INTERMITTENT
-    # It fails rarely (rate < 30%) but it DOES fail, and it IS passing now.
-    # This catches tests that fail once (streak=1) but recover immediately.
+    # Covers tests with low failure rate (0.1% to 30%)
     if current_status == 0 and failure_rate > 0 and failure_rate < 0.3:
-        return {"pattern": "FLAKY", "score": 0.7 + failure_rate, "reason": f"SPORADIC: Low failure rate ({failure_rate:.1%}) but unstable."}
+        if steps_since_fail > FIXED_THRESHOLD:
+            return {
+                "pattern": "FIXED",
+                "score": 0.0,
+                "reason": f"HEALED: Sporadic failures (rate {failure_rate:.1%}) but passed last {steps_since_fail} runs."
+            }
+        else:
+            return {
+                "pattern": "FLAKY",
+                "score": 0.95,
+                "reason": f"SPORADIC: Low failure rate ({failure_rate:.1%}) but unstable."
+            }
 
     # 2c. CLUSTER FLAKE
-    # It failed for a block (up to 3 runs) then recovered.
-    if current_status == 0 and max_streak <= 3:
-        return {"pattern": "FLAKY", "score": 0.9, "reason": f"CLUSTER: Failed {max_streak} times then recovered."}
+    if current_status == 0 and max_streak <= 6:
+        if steps_since_fail > FIXED_THRESHOLD:
+            return {
+                "pattern": "FIXED",
+                "score": 0.0,
+                "reason": f"HEALED: Had short failure bursts but passed last {steps_since_fail} runs."
+            }
+        else:
+            return {
+                "pattern": "FLAKY",
+                "score": 0.9,
+                "reason": f"CLUSTER: Failed {max_streak} times then recovered."
+            }
 
     # --- RULE 3: REGRESSION PATTERNS ---
 
-    # 3a. FIXED REGRESSION
-    # It failed for a LONG time (>6) and is now fixed (0).
+    # 3a. FIXED REGRESSION (Long burst)
     if current_status == 0 and max_streak > 6:
-        return {"pattern": "FIXED", "score": 0.1, "reason": f"Was broken for {max_streak} builds, now fixed."}
+        return {"pattern": "FIXED", "score": 0.0, "reason": f"FIXED: Was broken for {max_streak} builds, now fixed."}
 
-    # 3b. ACTIVE REGRESSION
-    # It is failing RIGHT NOW and has been for a while (>6).
-    # We lower the threshold to 6 because integration tests shouldn't fail 6 times in a row.
-    if current_status >= 6:
-        return {"pattern": "REGRESSION", "score": 0.05, "reason": f"Broken for {current_status} consecutive builds."}
+    # 3b. ACTIVE REGRESSION (Failing now)
+    if current_status >= 3:
+        return {"pattern": "REGRESSION", "score": 0.05, "reason": f"ACTIVE: Broken for {current_status} consecutive builds."}
 
     # --- FALLBACK ---
-    # E.g. Current status is 1 or 2 (failing recently but not long enough to be active regression)
-    # Likely a new flake starting.
-    return {"pattern": "AMBIGUOUS", "score": 0.6, "reason": "Suspicious short failure streak."}
+    return {"pattern": "AMBIGUOUS", "score": 0.6, "reason": "Suspicious failure pattern."}
 
 
 def _add_result(list_ref, job_name, test_id, analysis):
