@@ -46,6 +46,7 @@ The application requires a configuration file (YAML). When running in Docker, th
 ```yaml
 prometheus:
   url: "PROMETHEUS_URL"
+  # Change this to "all" to auto-discover everything
   job_name: "JENKINS_JOB_NAME"
   lookback_days: 60
   step_seconds: 3600 # 1 hour resolution
@@ -239,7 +240,6 @@ Grafana Dashboard example:
             "filterable": true,
             "inspect": false
           },
-          "fieldMinMax": false,
           "mappings": [
             {
               "options": {
@@ -262,11 +262,6 @@ Grafana Dashboard example:
                   "color": "red",
                   "index": 1,
                   "text": "REGRESSION"
-                },
-                "STABLE": {
-                  "color": "green",
-                  "index": 4,
-                  "text": "OK"
                 }
               },
               "type": "value"
@@ -324,7 +319,7 @@ Grafana Dashboard example:
                 "value": {
                   "mode": "lcd",
                   "type": "gauge",
-                  "valueDisplayMode": "hidden"
+                  "valueDisplayMode": "color"
                 }
               },
               {
@@ -341,19 +336,7 @@ Grafana Dashboard example:
               },
               {
                 "id": "displayName",
-                "value": "Flakiness score"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Flakiness score"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 134
+                "value": "Confidence"
               }
             ]
           }
@@ -393,7 +376,7 @@ Grafana Dashboard example:
           "root_selector": "",
           "source": "url",
           "type": "json",
-          "uql": "parse-json\n| project \"test_suite\", \"test_case\", \"failure_pattern\", \"flakiness_score\", \"reasoning\"\n| order by \"flakiness_score\" desc",
+          "uql": "parse-json\n| filter \"job_name\" == \"${jobname}\"\n| project \"test_suite\", \"test_case\", \"failure_pattern\", \"flakiness_score\", \"reasoning\"\n| order by \"flakiness_score\" desc",
           "url": "http://localhost:9184/flaky_tests.json",
           "url_options": {
             "data": "",
@@ -401,24 +384,8 @@ Grafana Dashboard example:
           }
         }
       ],
-      "title": "Flaky Test Analysis",
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {},
-            "includeByName": {},
-            "indexByName": {
-              "failure_pattern": 2,
-              "flakiness_score": 3,
-              "reasoning": 4,
-              "test_case": 1,
-              "test_suite": 0
-            },
-            "renameByName": {}
-          }
-        }
-      ],
+      "title": "AI Flaky Test Analysis for $jobname",
+      "transformations": [],
       "type": "table"
     }
   ],
@@ -430,7 +397,26 @@ Grafana Dashboard example:
     "quality"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {},
+        "datasource": "FlakyTests",
+        "definition": "parse-json | project \"job_name\" | distinct \"job_name\"",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Testsuite",
+        "multi": false,
+        "name": "jobname",
+        "options": [],
+        "query": "parse-json | project \"job_name\" | distinct \"job_name\"",
+        "queryType": "uql",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-6h",
@@ -440,7 +426,7 @@ Grafana Dashboard example:
   "timezone": "",
   "title": "Flaky Tests Detection",
   "uid": "flaky-tests",
-  "version": 1
+  "version": 2
 }
 ```
 

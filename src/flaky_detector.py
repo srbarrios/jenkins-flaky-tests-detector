@@ -7,7 +7,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from prometheus_api_client import PrometheusConnect
 from google import genai
-from google.genai import types
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_data(raw_data, start, end, step):
-    # Time alignment logic (Floor/Ceil)
     pd_start = pd.Timestamp(start).floor(f'{step}s')
     pd_end = pd.Timestamp(end).ceil(f'{step}s')
     full_time_index = pd.date_range(start=pd_start, end=pd_end, freq=f'{step}s')
@@ -38,12 +36,27 @@ def _normalize_data(raw_data, start, end, step):
 
 
 class MetricHarvester:
-    """Handles interaction with Prometheus and Data Normalization."""
     def __init__(self, prom_url):
         self.prom = PrometheusConnect(url=prom_url, disable_ssl=True)
 
+    def get_all_jobs(self):
+        """Discovers all job names that have failure age metrics."""
+        logger.info("Discovering jobs from Prometheus...")
+        # We query for the metric name to find all unique 'jobname' labels
+        # We look back 1 hour just to see what's active/exists
+        try:
+            # Querying the series API or a simple instant query
+            query = 'count by (jobname) (max_over_time(jenkins_build_test_case_failure_age[30d]))'
+            result = self.prom.custom_query(query=query)
+            jobs = [x['metric']['jobname'] for x in result if 'jobname' in x['metric']]
+            logger.info(f"Found {len(jobs)} jobs: {jobs}")
+            return jobs
+        except Exception as e:
+            logger.error(f"Failed to discover jobs: {e}")
+            return []
+
     def fetch_history(self, job_name, days, step):
-        logger.info(f"Fetching metrics for job: {job_name} over last {days} days...")
+        logger.info(f"Fetching metrics for job: {job_name}...")
         start_time = datetime.now() - timedelta(days=days)
         end_time = datetime.now()
 
@@ -54,11 +67,10 @@ class MetricHarvester:
                 query=query, start_time=start_time, end_time=end_time, step=step
             )
         except Exception as e:
-            logger.error(f"Prometheus Query Failed: {e}")
+            logger.error(f"Prometheus Query Failed for {job_name}: {e}")
             return {}
 
         if not result:
-            logger.warning("No metrics found.")
             return {}
 
         return _normalize_data(result, start_time, end_time, step)
@@ -71,26 +83,14 @@ def _count_transitions(lst):
     return flips
 
 
-def _add_result(list_ref, test_id, analysis):
-    parts = test_id.split("::")
-    list_ref.append({
-        "test_suite": parts[0],
-        "test_case": parts[1] if len(parts) > 1 else "Unknown",
-        "flakiness_score": analysis['score'],
-        "failure_pattern": analysis['pattern'],
-        "reasoning": analysis['reason']
-    })
-
-
 def _check_rules(history):
-    # --- METRICS CALCULATION ---
-    current_status = history[-1]      # 0 = Pass, >0 = Fail
-    max_streak = max(history)         # Longest failure block
+    current_status = history[-1]
+    max_streak = max(history)
     transitions = _count_transitions(history)
 
-    total_points = len(history)
-    failure_points = len([x for x in history if x > 0])
-    failure_rate = failure_points / total_points if total_points > 0 else 0
+    total = len(history)
+    fails = len([x for x in history if x > 0])
+    failure_rate = fails / total if total > 0 else 0
 
     # --- RULE 1: ENVIRONMENTAL / DEAD ---
     # If it passed 0% of the time, it's not flaky, it's broken infrastructure.
@@ -133,98 +133,48 @@ def _check_rules(history):
     # Likely a new flake starting.
     return {"pattern": "AMBIGUOUS", "score": 0.6, "reason": "Suspicious short failure streak."}
 
+
+def _add_result(list_ref, job_name, test_id, analysis):
+    parts = test_id.split("::")
+    list_ref.append({
+        "job_name": job_name, # Added field
+        "test_suite": parts[0],
+        "test_case": parts[1] if len(parts) > 1 else "Unknown",
+        "flakiness_score": analysis['score'],
+        "failure_pattern": analysis['pattern'],
+        "reasoning": analysis['reason']
+    })
+
+
 class HybridAnalyzer:
-    """
-    Applies strict rules first. If the pattern is ambiguous, delegates to Gemini.
-    """
     def __init__(self, api_key, model_name):
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
-    def analyze_all(self, test_histories):
-        final_results = []
+    def analyze_all(self, job_name, test_histories):
+        """Analyzes a specific job's history."""
+        results = []
         ambiguous_cases = {}
 
-        # PHASE 1: Algorithmic Filter
-        logger.info("Phase 1: Running Heuristic Rules...")
         for test_id, history in test_histories.items():
-            if sum(history) == 0: continue # Skip all pass
+            if sum(history) == 0: continue
 
             rule_result = _check_rules(history)
 
             if rule_result['pattern'] != 'AMBIGUOUS':
-                # We are confident, add to final results directly
-                _add_result(final_results, test_id, rule_result)
+                _add_result(results, job_name, test_id, rule_result)
             else:
-                # We are not sure, send to AI
                 ambiguous_cases[test_id] = history
 
-        # PHASE 2: AI Analysis for Ambiguous Cases
+        # Fallback for ambiguous
         if ambiguous_cases:
-            logger.info(f"Phase 2: Sending {len(ambiguous_cases)} ambiguous cases to Gemini...")
-            ai_results = self._ask_gemini(ambiguous_cases)
-            final_results.extend(ai_results)
-        else:
-            logger.info("Phase 2: Skipped (No ambiguous cases found).")
-
-        return final_results
-
-    def _ask_gemini(self, cases):
-        results = []
-        batch_size = 20
-        items = list(cases.items())
-
-        response_schema = types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "test_id": types.Schema(type=types.Type.STRING),
-                    "pattern": types.Schema(type=types.Type.STRING, enum=["FLAKY", "REGRESSION", "ENVIRONMENTAL"]),
-                    "reason": types.Schema(type=types.Type.STRING),
-                    "confidence": types.Schema(type=types.Type.NUMBER)
-                },
-                required=["test_id", "pattern", "reason"]
-            )
-        )
-
-        for i in range(0, len(items), batch_size):
-            batch = dict(items[i:i+batch_size])
-            prompt = f"""
-            Analyze these ambiguous test failure patterns (0=Pass, N=Failure Age).
-            Determine if they are FLAKY (random/short-lived) or REGRESSION (systematic).
-            
-            Strictly output JSON.
-            Data: {json.dumps(batch)}
-            """
-
-            try:
-                resp = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=response_schema
-                    )
-                )
-                ai_data = json.loads(resp.text)
-
-                # Map back to internal format
-                for item in ai_data:
-                    _add_result(results, item['test_id'], {
-                        'pattern': item['pattern'],
-                        'score': 0.8 if item['pattern'] == 'FLAKY' else 0.2,
-                        'reason': f"AI: {item['reason']}"
-                    })
-            except Exception as e:
-                logger.error(f"Gemini Batch Error: {e}")
-                # Treat failed AI calls as Unknown Regressions to be safe
-                for tid in batch.keys():
-                    _add_result(results, tid, {'pattern': 'UNKNOWN', 'score': 0.5, 'reason': 'AI Analysis Failed'})
-
-            time.sleep(1)
+            for tid, hist in ambiguous_cases.items():
+                _add_result(results, job_name, tid, {
+                    'pattern': 'UNKNOWN', 'score': 0.5, 'reason': f"Complex pattern: {hist[-5:]}"
+                })
 
         return results
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -235,21 +185,35 @@ def main():
         config = yaml.safe_load(f)
 
     harvester = MetricHarvester(config['prometheus']['url'])
-    histories = harvester.fetch_history(
-        config['prometheus']['job_name'],
-        config['prometheus']['lookback_days'],
-        config['prometheus']['step_seconds']
-    )
+    analyzer = HybridAnalyzer(config.get('gemini', {}).get('api_key'), config.get('gemini', {}).get('model'))
 
-    # Initialize Hybrid Analyzer
-    analyzer = HybridAnalyzer(config['gemini']['api_key'], config['gemini']['model'])
-    results = analyzer.analyze_all(histories)
+    # 1. Discover Jobs
+    all_jobs = harvester.get_all_jobs()
 
+    # Filter if config has specific include list (Optional feature, implementing simple filter)
+    target_job_config = config['prometheus'].get('job_name')
+    if target_job_config and target_job_config != "all":
+        all_jobs = [target_job_config]
+
+    full_report = []
+
+    # 2. Process each job
+    for job in all_jobs:
+        histories = harvester.fetch_history(
+            job,
+            config['prometheus']['lookback_days'],
+            config['prometheus']['step_seconds']
+        )
+
+        job_results = analyzer.analyze_all(job, histories)
+        full_report.extend(job_results)
+
+    # 3. Save Master Report
     output_path = f"{config['output']['directory']}/{config['output']['filename']}"
     with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(full_report, f, indent=2)
 
-    logger.info(f"Analysis complete. Written to {output_path}")
+    logger.info(f"Analysis complete. Processed {len(all_jobs)} jobs. Total issues: {len(full_report)}")
 
 if __name__ == "__main__":
     main()

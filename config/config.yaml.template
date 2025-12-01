@@ -1,5 +1,6 @@
 prometheus:
   url: "PROMETHEUS_URL"
+  # Change this to "all" to auto-discover everything
   job_name: "JENKINS_JOB_NAME"
   lookback_days: 15
   step_seconds: 3600 # 1 hour resolution
