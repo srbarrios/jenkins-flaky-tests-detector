@@ -108,7 +108,7 @@ def _check_rules(history):
     # It fails rarely (rate < 30%) but it DOES fail, and it IS passing now.
     # This catches tests that fail once (streak=1) but recover immediately.
     if current_status == 0 and failure_rate > 0 and failure_rate < 0.3:
-        return {"pattern": "FLAKY", "score": 0.8, "reason": f"SPORADIC: Low failure rate ({failure_rate:.1%}) but unstable."}
+        return {"pattern": "FLAKY", "score": 0.7 + failure_rate, "reason": f"SPORADIC: Low failure rate ({failure_rate:.1%}) but unstable."}
 
     # 2c. CLUSTER FLAKE
     # It failed for a block (up to 3 runs) then recovered.
