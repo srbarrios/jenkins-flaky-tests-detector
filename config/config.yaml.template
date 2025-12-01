@@ -1,0 +1,13 @@
+prometheus:
+  url: "PROMETHEUS_URL"
+  job_name: "JENKINS_JOB_NAME"
+  lookback_days: 15
+  step_seconds: 3600 # 1 hour resolution
+
+gemini:
+  api_key: "YOUR_API_KEY"
+  model: "gemini-2.5-flash"
+
+output:
+  directory: "/data"
+  filename: "flaky_tests.json"

@@ -13,149 +13,218 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def _normalize_data(raw_data, start, end, step):
+    # Time alignment logic (Floor/Ceil)
+    pd_start = pd.Timestamp(start).floor(f'{step}s')
+    pd_end = pd.Timestamp(end).ceil(f'{step}s')
+    full_time_index = pd.date_range(start=pd_start, end=pd_end, freq=f'{step}s')
+
+    normalized_history = {}
+    for entry in raw_data:
+        metric = entry['metric']
+        full_name = f"{metric.get('suite', 'unknown')}::{metric.get('case', 'unknown')}"
+        try:
+            df = pd.DataFrame(entry['values'], columns=['ds', 'y'])
+            df['ds'] = pd.to_datetime(df['ds'], unit='s')
+            df['y'] = pd.to_numeric(df['y'])
+            df = df.set_index('ds')
+            df_resampled = df.resample(f'{step}s').max()
+            df_reindexed = df_resampled.reindex(full_time_index).fillna(0)
+            normalized_history[full_name] = df_reindexed['y'].astype(int).tolist()
+        except Exception:
+            continue
+    return normalized_history
+
+
 class MetricHarvester:
+    """Handles interaction with Prometheus and Data Normalization."""
     def __init__(self, prom_url):
         self.prom = PrometheusConnect(url=prom_url, disable_ssl=True)
 
     def fetch_history(self, job_name, days, step):
-        """Fetches failure age and reconstructs the sparse time series."""
         logger.info(f"Fetching metrics for job: {job_name} over last {days} days...")
-
         start_time = datetime.now() - timedelta(days=days)
         end_time = datetime.now()
 
-        # Query for FAILED or REGRESSION statuses
         query = f'jenkins_build_test_case_failure_age{{jobname="{job_name}", status=~"FAILED|REGRESSION"}}'
 
-        # Get data as a list of metric objects
-        result = self.prom.custom_query_range(
-            query=query,
-            start_time=start_time,
-            end_time=end_time,
-            step=step
-        )
+        try:
+            result = self.prom.custom_query_range(
+                query=query, start_time=start_time, end_time=end_time, step=step
+            )
+        except Exception as e:
+            logger.error(f"Prometheus Query Failed: {e}")
+            return {}
 
         if not result:
             logger.warning("No metrics found.")
             return {}
 
-        # Log sample of raw data to debug
-        # logger.info(f"Raw Result Sample: {str(result)[:500]}")
+        return _normalize_data(result, start_time, end_time, step)
 
-        return self._normalize_data(result, start_time, end_time, step)
 
-    def _normalize_data(self, raw_data, start, end, step):
-        """
-        Converts Prometheus format to a continuous timeline.
-        IMPUTATION LOGIC: Reindexes time series to fill missing gaps with 0.
-        """
-        logger.info("Normalizing data and imputing '0' for missing data points...")
-        normalized_history = {}
+def _count_transitions(lst):
+    flips = 0
+    for i in range(1, len(lst)):
+        if (lst[i-1] > 0) != (lst[i] > 0): flips += 1
+    return flips
 
-        pd_start = pd.Timestamp(start).floor(f'{step}s')
-        pd_end = pd.Timestamp(end).ceil(f'{step}s')
 
-        full_time_index = pd.date_range(start=pd_start, end=pd_end, freq=f'{step}s')
+def _add_result(list_ref, test_id, analysis):
+    parts = test_id.split("::")
+    list_ref.append({
+        "test_suite": parts[0],
+        "test_case": parts[1] if len(parts) > 1 else "Unknown",
+        "flakiness_score": analysis['score'],
+        "failure_pattern": analysis['pattern'],
+        "reasoning": analysis['reason']
+    })
 
-        for entry in raw_data:
-            metric = entry['metric']
-            suite = metric.get('suite', 'unknown')
-            case = metric.get('case', 'unknown')
-            full_name = f"{suite}::{case}"
 
-            # Create DataFrame from specific metric history
-            values = entry['values']
-            df = pd.DataFrame(values, columns=['ds', 'y'])
-            df['ds'] = pd.to_datetime(df['ds'], unit='s')
-            df['y'] = pd.to_numeric(df['y'])
+def _check_rules(history):
+    # --- METRICS CALCULATION ---
+    current_status = history[-1]      # 0 = Pass, >0 = Fail
+    max_streak = max(history)         # Longest failure block
+    transitions = _count_transitions(history)
 
-            df = df.set_index('ds')
+    total_points = len(history)
+    failure_points = len([x for x in history if x > 0])
+    failure_rate = failure_points / total_points if total_points > 0 else 0
 
-            # Resample and fill missing intervals with 0 (Pass)
-            try:
-                # 'max' takes the worst status in that hour (if multiple runs occurred)
-                df_resampled = df.resample(f'{step}s').max()
+    # --- RULE 1: ENVIRONMENTAL / DEAD ---
+    # If it passed 0% of the time, it's not flaky, it's broken infrastructure.
+    if failure_rate == 1.0:
+        return {"pattern": "ENVIRONMENTAL", "score": 0.0, "reason": "Test has 100% failure rate."}
 
-                # Reindex aligns the resampled data to our perfect timeline
-                df_reindexed = df_resampled.reindex(full_time_index).fillna(0)
+    # --- RULE 2: FLAKY PATTERNS ---
 
-                # Store the sequence of integers
-                normalized_history[full_name] = df_reindexed['y'].astype(int).tolist()
-            except Exception as e:
-                logger.error(f"Error normalizing {full_name}: {e}")
-                continue
+    # 2a. HIGH OSCILLATION (The "Yo-Yo" Effect)
+    # It flips between pass/fail frequently (>= 3 times).
+    if transitions >= 3:
+        return {"pattern": "FLAKY", "score": 1.0, "reason": f"OSCILLATION: Flipped state {transitions} times."}
 
-        return normalized_history
+    # 2b. SPORADIC / INTERMITTENT
+    # It fails rarely (rate < 30%) but it DOES fail, and it IS passing now.
+    # This catches tests that fail once (streak=1) but recover immediately.
+    if current_status == 0 and failure_rate > 0 and failure_rate < 0.3:
+        return {"pattern": "FLAKY", "score": 0.8, "reason": f"SPORADIC: Low failure rate ({failure_rate:.1%}) but unstable."}
 
-class FlakeAnalyzer:
+    # 2c. CLUSTER FLAKE
+    # It failed for a block (up to 3 runs) then recovered.
+    if current_status == 0 and max_streak <= 3:
+        return {"pattern": "FLAKY", "score": 0.9, "reason": f"CLUSTER: Failed {max_streak} times then recovered."}
+
+    # --- RULE 3: REGRESSION PATTERNS ---
+
+    # 3a. FIXED REGRESSION
+    # It failed for a LONG time (>6) and is now fixed (0).
+    if current_status == 0 and max_streak > 6:
+        return {"pattern": "FIXED", "score": 0.1, "reason": f"Was broken for {max_streak} builds, now fixed."}
+
+    # 3b. ACTIVE REGRESSION
+    # It is failing RIGHT NOW and has been for a while (>6).
+    # We lower the threshold to 6 because integration tests shouldn't fail 6 times in a row.
+    if current_status >= 6:
+        return {"pattern": "REGRESSION", "score": 0.05, "reason": f"Broken for {current_status} consecutive builds."}
+
+    # --- FALLBACK ---
+    # E.g. Current status is 1 or 2 (failing recently but not long enough to be active regression)
+    # Likely a new flake starting.
+    return {"pattern": "AMBIGUOUS", "score": 0.6, "reason": "Suspicious short failure streak."}
+
+class HybridAnalyzer:
+    """
+    Applies strict rules first. If the pattern is ambiguous, delegates to Gemini.
+    """
     def __init__(self, api_key, model_name):
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
-    def analyze_batch(self, test_histories):
-        """Sends a batch of time-series data to Gemini for classification."""
+    def analyze_all(self, test_histories):
+        final_results = []
+        ambiguous_cases = {}
+
+        # PHASE 1: Algorithmic Filter
+        logger.info("Phase 1: Running Heuristic Rules...")
+        for test_id, history in test_histories.items():
+            if sum(history) == 0: continue # Skip all pass
+
+            rule_result = _check_rules(history)
+
+            if rule_result['pattern'] != 'AMBIGUOUS':
+                # We are confident, add to final results directly
+                _add_result(final_results, test_id, rule_result)
+            else:
+                # We are not sure, send to AI
+                ambiguous_cases[test_id] = history
+
+        # PHASE 2: AI Analysis for Ambiguous Cases
+        if ambiguous_cases:
+            logger.info(f"Phase 2: Sending {len(ambiguous_cases)} ambiguous cases to Gemini...")
+            ai_results = self._ask_gemini(ambiguous_cases)
+            final_results.extend(ai_results)
+        else:
+            logger.info("Phase 2: Skipped (No ambiguous cases found).")
+
+        return final_results
+
+    def _ask_gemini(self, cases):
+        results = []
+        batch_size = 20
+        items = list(cases.items())
 
         response_schema = types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "test_suite": types.Schema(type=types.Type.STRING),
-                    "test_case": types.Schema(type=types.Type.STRING),
-                    "flakiness_score": types.Schema(type=types.Type.NUMBER, description="Confidence 0.0 to 1.0"),
-                    "failure_pattern": types.Schema(type=types.Type.STRING, enum=["FLAKY", "REGRESSION", "ENVIRONMENTAL", "UNKNOWN"]),
-                    "reasoning": types.Schema(type=types.Type.STRING),
+                    "test_id": types.Schema(type=types.Type.STRING),
+                    "pattern": types.Schema(type=types.Type.STRING, enum=["FLAKY", "REGRESSION", "ENVIRONMENTAL"]),
+                    "reason": types.Schema(type=types.Type.STRING),
+                    "confidence": types.Schema(type=types.Type.NUMBER)
                 },
-                required=["test_suite", "test_case", "flakiness_score", "reasoning"]
+                required=["test_id", "pattern", "reason"]
             )
         )
 
-        # --- IMPROVED PROMPT ---
-        prompt = f"""
-        You are a Senior QA Automation Engineer specializing in detecting 'Flaky Tests' in complex infrastructure (Salt/Linux).
-        Analyze the following time-series data of 'Failure Age' (consecutive failures) over 15 days.
-        
-        Data Legend:
-        - 0: Passed
-        - 1, 2, 3...: The test has failed for X consecutive builds.
-        
-        CRITICAL CLASSIFICATION RULES:
-        
-        1. FLAKY (High Priority):
-           - Chaotic oscillation: `1, 0, 1, 0, 2, 0` (Randomly fails).
-           - **CLUSTER FLAKES (Common):** A test fails for a short burst and then passes WITHOUT a long-term pattern.
-             - Example: `0, 0, 1, 2, 0, 1, 0` (Failed 2 times then passed, then failed again once). 
-             - Logic: If a failure streak is short (< 3 consecutive) and resolves, assume it is FLAKY/Unstable infrastructure, NOT a code regression.
-        
-        2. REGRESSION (Real Bugs):
-           - Long, sustained failure blocks that require a fix.
-           - Example: `0, 0, 1, 2, 3, 4, 5, 6, 7... 15`. (Broken for days).
-           - Logic: If failure age climbs high (> 6) or persists for the majority of the dataset, it is a Regression.
-        
-        3. ENVIRONMENTAL:
-           - Example: `25, 25, 25` or `10, 10, 10` (Metric is stuck/stale).
-           - Logic: The failure age isn't changing, implying the job isn't running or the metric is frozen.
+        for i in range(0, len(items), batch_size):
+            batch = dict(items[i:i+batch_size])
+            prompt = f"""
+            Analyze these ambiguous test failure patterns (0=Pass, N=Failure Age).
+            Determine if they are FLAKY (random/short-lived) or REGRESSION (systematic).
+            
+            Strictly output JSON.
+            Data: {json.dumps(batch)}
+            """
 
-        Task: Identify the Flaky tests. Be aggressive in marking short failure streaks as FLAKY.
-        
-        Analyze these tests:
-        {json.dumps(test_histories)}
-        """
-
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                    temperature=0.2
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=response_schema
+                    )
                 )
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            logger.error(f"Gemini API Error: {e}")
-            return []
+                ai_data = json.loads(resp.text)
+
+                # Map back to internal format
+                for item in ai_data:
+                    _add_result(results, item['test_id'], {
+                        'pattern': item['pattern'],
+                        'score': 0.8 if item['pattern'] == 'FLAKY' else 0.2,
+                        'reason': f"AI: {item['reason']}"
+                    })
+            except Exception as e:
+                logger.error(f"Gemini Batch Error: {e}")
+                # Treat failed AI calls as Unknown Regressions to be safe
+                for tid in batch.keys():
+                    _add_result(results, tid, {'pattern': 'UNKNOWN', 'score': 0.5, 'reason': 'AI Analysis Failed'})
+
+            time.sleep(1)
+
+        return results
 
 def main():
     parser = argparse.ArgumentParser()
@@ -165,7 +234,6 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # 1. Harvest Data
     harvester = MetricHarvester(config['prometheus']['url'])
     histories = harvester.fetch_history(
         config['prometheus']['job_name'],
@@ -173,44 +241,13 @@ def main():
         config['prometheus']['step_seconds']
     )
 
-    # 2. Pre-Filtering (Optimization)
-    candidates = {}
-    for test, history in histories.items():
-        # Heuristic: Ignore if never failed (sum=0)
-        # We also might want to ignore if it is purely all 0s except for the last day?
-        # For now, just ensuring it has SOME failures is enough.
-        if sum(history) > 0:
-            candidates[test] = history
+    # Initialize Hybrid Analyzer
+    analyzer = HybridAnalyzer(config['gemini']['api_key'], config['gemini']['model'])
+    results = analyzer.analyze_all(histories)
 
-    logger.info(f"Identified {len(candidates)} candidates for AI analysis.")
-
-    # 3. Analyze with Gemini (Batching)
-    if not candidates:
-        logger.warning("No candidates found. Exiting analysis.")
-        # Create empty file to prevent Grafana 404
-        output_path = f"{config['output']['directory']}/{config['output']['filename']}"
-        with open(output_path, 'w') as f:
-            json.dump([], f)
-        return
-
-    analyzer = FlakeAnalyzer(config['gemini']['api_key'], config['gemini']['model'])
-    final_results = []
-
-    batch_size = 30 # Avoid token limits
-    test_items = list(candidates.items())
-
-    for i in range(0, len(test_items), batch_size):
-        batch = dict(test_items[i:i+batch_size])
-        logger.info(f"Processing batch {i} to {i+batch_size}...")
-        results = analyzer.analyze_batch(batch)
-        if results:
-            final_results.extend(results)
-        time.sleep(1) # Rate limit courtesy
-
-    # 4. Serialize Output
     output_path = f"{config['output']['directory']}/{config['output']['filename']}"
     with open(output_path, 'w') as f:
-        json.dump(final_results, f, indent=2)
+        json.dump(results, f, indent=2)
 
     logger.info(f"Analysis complete. Written to {output_path}")
 
