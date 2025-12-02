@@ -1,5 +1,7 @@
 # AI-Driven Flaky Test Detection Agent
 
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/351363d2-f7db-42bd-ba63-1aa4c44b2414" />
+
 ## Overview
 
 The `flaky-detector` is an observability agent designed to restore trust in the CI/CD pipeline. It tackles the "Crisis of Determinism" by distinguishing between legitimate code regressions and non-deterministic "flaky" tests.
