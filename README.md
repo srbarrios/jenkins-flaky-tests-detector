@@ -20,7 +20,7 @@ graph TD
     A[Jenkins CI] -->|Builds| B(jenkins-exporter)
     B -->|Scrape| C[Prometheus]
     C -->|Query 15d History| D[flaky-detector]
-    D -->|Time Series Data| E[Google Gemini API]
+    D -->|Time Series Data| E[Processed by a set of rules, otherwise ask Gemini LLM]
     E -->|JSON Classification| D
     D -->|Writes| F[flaky_tests.json]
     F -->|Served via HTTP| G[Grafana Infinity DS]
